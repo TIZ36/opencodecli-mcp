@@ -1,0 +1,38 @@
+# Binary artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+mcpserver
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Documentation (not needed in image)
+*.md
+
+# Workspace (mounted at runtime)
+workspace/

@@ -1,0 +1,35 @@
+version: "3.8"
+
+services:
+  mcpserver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: opencode-mcp
+    ports:
+      - "${MCP_PORT:-9876}:9876"
+    environment:
+      - MCP_ADDR=:9876
+      - MCP_TARGET=${MCP_TARGET:-opencode-cli}
+      - MCP_TIMEOUT_SEC=${MCP_TIMEOUT_SEC:-120}
+    volumes:
+      # Mount workspace directory for code editing
+      - ${WORKSPACE_PATH:-./workspace}:/workspace:rw
+      # Mount opencode-cli binary if needed
+      - ${OPENCODE_CLI_PATH:-/usr/local/bin/opencode-cli}:/usr/local/bin/opencode-cli:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9876/health"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 256M
