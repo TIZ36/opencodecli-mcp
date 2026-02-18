@@ -133,6 +133,14 @@ func main() {
 		DefaultModel:   getenv("MCP_DEFAULT_MODEL", defaultModel),
 	}
 
+	log.Printf("=== opencode-mcp server starting ===")
+	log.Printf("  MCP_ADDR:        %s", cfg.Addr)
+	log.Printf("  MCP_TARGET:      %s", cfg.Target)
+	log.Printf("  MCP_TIMEOUT_SEC: %d", int(cfg.DefaultTimeout.Seconds()))
+	log.Printf("  MCP_DEFAULT_MODEL: %s", cfg.DefaultModel)
+	log.Printf("  Endpoints:       POST /mcp (MCP), GET /health, POST /exec, POST /exec/stream")
+	log.Printf("================================")
+
 	// Pre-fetch available models in background
 	go func() {
 		fetchAvailableModels(cfg.Target)
@@ -164,14 +172,6 @@ func main() {
 			return
 		}
 
-		// Check Accept header for SSE support
-		// Default to SSE for tools/call to provide streaming responses
-		acceptHeader := r.Header.Get("Accept")
-		acceptSSE := strings.Contains(acceptHeader, "text/event-stream")
-
-		// Also check for application/json explicitly - if not specified, default to SSE
-		explicitJSON := strings.Contains(acceptHeader, "application/json") && !strings.Contains(acceptHeader, "text/event-stream")
-
 		var req mcpRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeMCPError(w, nil, -32700, "invalid JSON")
@@ -182,12 +182,7 @@ func main() {
 			return
 		}
 
-		// For tools/call, prefer SSE unless explicitly requesting JSON
-		if req.Method == "tools/call" && !explicitJSON {
-			acceptSSE = true
-		}
-
-		log.Printf("MCP request: method=%s id=%v sse=%v accept=%q", req.Method, req.ID, acceptSSE, acceptHeader)
+		log.Printf("[MCP] request method=%s id=%v", req.Method, req.ID)
 
 		// Handle session
 		sessionID := r.Header.Get("Mcp-Session-Id")
@@ -199,10 +194,12 @@ func main() {
 			sess = sessions.create()
 			sessionID = sess.id
 			w.Header().Set("Mcp-Session-Id", sessionID)
+			log.Printf("[MCP] initialize -> session=%s", sessionID)
 			handleInitialize(w, req)
 			return
 		case "notifications/initialized":
 			// Client notification, just acknowledge
+			log.Printf("[MCP] notifications/initialized ack")
 			w.WriteHeader(http.StatusNoContent)
 			return
 		default:
@@ -219,13 +216,11 @@ func main() {
 
 		switch req.Method {
 		case "tools/list":
+			log.Printf("[MCP] tools/list -> returning tool list")
 			handleToolsList(w, req)
 		case "tools/call":
-			if acceptSSE {
-				handleToolsCallSSE(w, r.Context(), cfg, req)
-			} else {
-				handleToolsCall(w, r.Context(), cfg, req)
-			}
+			// Always use SSE for real-time streaming of opencode output
+			handleToolsCallSSE(w, r.Context(), cfg, req)
 		default:
 			writeMCPError(w, req.ID, -32601, fmt.Sprintf("method not found: %s", req.Method))
 		}
@@ -344,7 +339,7 @@ func main() {
 		WriteTimeout: 0,
 	}
 
-	log.Printf("mcpserver listening on %s", cfg.Addr)
+	log.Printf("mcpserver listening on %s (ready)", cfg.Addr)
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
@@ -530,10 +525,15 @@ func handleToolsCall(w http.ResponseWriter, ctx context.Context, cfg serverConfi
 		model := runArgs.Model
 		if model == "" {
 			model = getDefaultModel(cfg)
-			log.Printf("Using default model: %s", model)
+			if model != "" {
+				log.Printf("Using default model: %s", model)
+			}
 		}
 
-		cmdArgs := []string{"run", "--format", "json", "--model", model}
+		cmdArgs := []string{"run", "--format", "json"}
+		if model != "" {
+			cmdArgs = append(cmdArgs, "--model", model)
+		}
 		if runArgs.Session != "" {
 			cmdArgs = append(cmdArgs, "--session", runArgs.Session)
 		}
@@ -765,19 +765,21 @@ func fetchAvailableModels(target string) []string {
 	return models
 }
 
-// getDefaultModel returns the best available model
+// getDefaultModel returns the best available model, or empty string to let opencode use its default.
+// When fetchAvailableModels fails (e.g., wrong opencode binary), we return "" to avoid ProviderModelNotFoundError.
 func getDefaultModel(cfg serverConfig) string {
 	models := fetchAvailableModels(cfg.Target)
 
-	// Preferred models in order (tested to work with --format json)
+	// Preferred models in order (provider/model format per opencode.ai docs)
 	preferredModels := []string{
-		"github-copilot/gpt-5.2-codex", // Codex 5.2
+		"github-copilot/gpt-5.2-codex",
 		"github-copilot/gpt-5.1-codex",
+		"opencode/gpt-5.2-codex",
+		"opencode/gpt-5.1-codex",
 		"github-copilot/gpt-4o",
-		"github-copilot/gpt-4.1",
+		"github-copilot/claude-sonnet-4.5",
 	}
 
-	// Try preferred models first (exact match)
 	for _, preferred := range preferredModels {
 		for _, available := range models {
 			if available == preferred {
@@ -787,7 +789,6 @@ func getDefaultModel(cfg serverConfig) string {
 		}
 	}
 
-	// Try partial match
 	for _, preferred := range preferredModels {
 		for _, available := range models {
 			if strings.Contains(available, preferred) {
@@ -797,32 +798,59 @@ func getDefaultModel(cfg serverConfig) string {
 		}
 	}
 
-	// Return first available model from github-copilot provider
 	for _, available := range models {
-		if strings.HasPrefix(available, "github-copilot/") {
-			log.Printf("Selected first github-copilot model: %s", available)
+		if strings.HasPrefix(available, "github-copilot/") || strings.HasPrefix(available, "opencode/") {
+			log.Printf("Selected first available model: %s", available)
 			return available
 		}
 	}
 
-	// Return first available model
 	if len(models) > 0 {
 		log.Printf("Selected first available model: %s", models[0])
 		return models[0]
 	}
 
-	// Fallback
-	log.Printf("No models available, using fallback: %s", cfg.DefaultModel)
-	return cfg.DefaultModel
+	// Don't use hardcoded fallback - let opencode use its own default to avoid ProviderModelNotFoundError
+	log.Printf("No models from 'opencode models', omitting --model (opencode will use its default)")
+	return ""
+}
+
+// sendProgress sends MCP notifications/progress for real-time client display
+func sendProgress(w io.Writer, flusher http.Flusher, id any, progress int, message string) {
+	notif := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "notifications/progress",
+		"params": map[string]any{
+			"progressToken": id,
+			"progress":      progress,
+			"message":       message,
+		},
+	}
+	b, _ := json.Marshal(notif)
+	_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+// truncateForLog returns s truncated to maxLen with "..." if longer
+func truncateForLog(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }
 
 // SSE streaming for tools/call
 func handleToolsCallSSE(w http.ResponseWriter, ctx context.Context, cfg serverConfig, req mcpRequest) {
 	var params toolCallParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
+		log.Printf("[tools/call] invalid params: %v", err)
 		writeMCPError(w, req.ID, -32602, "invalid params")
 		return
 	}
+
+	log.Printf("[tools/call] tool=%s id=%v", params.Name, req.ID)
 
 	// Build command args based on tool
 	var cmdArgs []string
@@ -843,6 +871,7 @@ func handleToolsCallSSE(w http.ResponseWriter, ctx context.Context, cfg serverCo
 		cmdArgs = args.Args
 		cwd = args.Cwd
 		stdin = args.Stdin
+		log.Printf("[tools/call] exec args=%v cwd=%q", args.Args, cwd)
 
 	case toolRun:
 		var runArgs struct {
@@ -866,10 +895,15 @@ func handleToolsCallSSE(w http.ResponseWriter, ctx context.Context, cfg serverCo
 		model := runArgs.Model
 		if model == "" {
 			model = getDefaultModel(cfg)
-			log.Printf("SSE: Using default model: %s", model)
+			if model != "" {
+				log.Printf("SSE: Using default model: %s", model)
+			}
 		}
 
-		cmdArgs = []string{"run", "--format", "json", "--model", model}
+		cmdArgs = []string{"run", "--format", "json"}
+		if model != "" {
+			cmdArgs = append(cmdArgs, "--model", model)
+		}
 		if runArgs.Session != "" {
 			cmdArgs = append(cmdArgs, "--session", runArgs.Session)
 		}
@@ -881,15 +915,20 @@ func handleToolsCallSSE(w http.ResponseWriter, ctx context.Context, cfg serverCo
 		}
 		cmdArgs = append(cmdArgs, runArgs.Message)
 		cwd = runArgs.Cwd
+		log.Printf("[tools/call] run message=%s model=%s cwd=%q session=%s files=%v",
+			truncateForLog(runArgs.Message, 80), model, cwd, runArgs.Session, runArgs.Files)
 
 	case toolModels:
 		cmdArgs = []string{"models"}
+		log.Printf("[tools/call] models")
 
 	case toolSessionList:
 		cmdArgs = []string{"session", "list"}
+		log.Printf("[tools/call] session list")
 
 	case toolAgentList:
 		cmdArgs = []string{"agent", "list"}
+		log.Printf("[tools/call] agent list")
 
 	default:
 		writeMCPError(w, req.ID, -32602, fmt.Sprintf("unknown tool: %s", params.Name))
@@ -913,6 +952,8 @@ func handleToolsCallSSE(w http.ResponseWriter, ctx context.Context, cfg serverCo
 		cmd.Dir = cwd
 	}
 
+	log.Printf("[tools/call] exec: %s %s (cwd=%q)", cfg.Target, strings.Join(cmdArgs, " "), cwd)
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		writeMCPError(w, req.ID, -32000, err.Error())
@@ -929,10 +970,11 @@ func handleToolsCallSSE(w http.ResponseWriter, ctx context.Context, cfg serverCo
 		return
 	}
 
-	// SSE response
+	// SSE response - disable buffering for real-time streaming
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no") // nginx: disable proxy buffering
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeMCPError(w, req.ID, -32000, "streaming unsupported")
@@ -945,8 +987,11 @@ func handleToolsCallSSE(w http.ResponseWriter, ctx context.Context, cfg serverCo
 		_, _ = io.Copy(&stderrBuf, stderrPipe)
 	}()
 
-	// Collect text for final response
+	// Collect text and tool outputs for final response
 	var textCollector strings.Builder
+	var toolOutputs []string
+	var eventCount int
+	eventTypeCounts := make(map[string]int)
 
 	// Stream stdout line by line for better JSON event handling
 	scanner := bufio.NewScanner(stdout)
@@ -963,15 +1008,106 @@ func handleToolsCallSSE(w http.ResponseWriter, ctx context.Context, cfg serverCo
 			if err := json.Unmarshal([]byte(line), &event); err == nil {
 				eventType, _ := event["type"].(string)
 				eventData := extractEventData(event)
+				eventTypeCounts[eventType]++
+				eventCount++
 
-				// Collect text for final response
+				// Log every event with step details for observability
+				switch eventType {
+				case "text":
+					if text, ok := eventData.(string); ok {
+						log.Printf("[stream] event#%d type=text len=%d", eventCount, len(text))
+						log.Printf("[stream]   content: %s", truncateForLog(text, 300))
+					}
+				case "tool_use":
+					if m, ok := eventData.(map[string]any); ok {
+						toolName, _ := m["tool"].(string)
+						status, _ := m["status"].(string)
+						inputPreview := ""
+						if input, ok := m["input"].(map[string]any); ok {
+							inputJSON, _ := json.Marshal(input)
+							inputPreview = truncateForLog(string(inputJSON), 200)
+						}
+						outputPreview := ""
+						switch out := m["output"].(type) {
+						case string:
+							outputPreview = truncateForLog(out, 300)
+						default:
+							if out != nil {
+								b, _ := json.Marshal(out)
+								outputPreview = truncateForLog(string(b), 300)
+							}
+						}
+						log.Printf("[stream] event#%d type=tool_use tool=%s status=%s", eventCount, toolName, status)
+						if inputPreview != "" {
+							log.Printf("[stream]   input:  %s", inputPreview)
+						}
+						if outputPreview != "" {
+							log.Printf("[stream]   output: %s", outputPreview)
+						}
+					}
+				case "step_start":
+					if part, ok := event["part"].(map[string]any); ok {
+						reason, _ := part["reason"].(string)
+						snapshot, _ := part["snapshot"].(string)
+						partType, _ := part["type"].(string)
+						log.Printf("[stream] event#%d type=step_start reason=%q partType=%s snapshot=%s",
+							eventCount, reason, partType, truncateForLog(snapshot, 12))
+					} else {
+						log.Printf("[stream] event#%d type=step_start", eventCount)
+					}
+				case "step_finish":
+					if part, ok := event["part"].(map[string]any); ok {
+						reason, _ := part["reason"].(string)
+						snapshot, _ := part["snapshot"].(string)
+						cost, _ := part["cost"].(float64)
+						tokens, _ := part["tokens"].(map[string]any)
+						log.Printf("[stream] event#%d type=step_finish reason=%q cost=$%.4f", eventCount, reason, cost)
+						if tokens != nil {
+							in, _ := tokens["input"].(float64)
+							out, _ := tokens["output"].(float64)
+							log.Printf("[stream]   tokens: input=%.0f output=%.0f snapshot=%s", in, out, truncateForLog(snapshot, 12))
+						}
+					} else {
+						log.Printf("[stream] event#%d type=step_finish", eventCount)
+					}
+				default:
+					log.Printf("[stream] event#%d type=%s", eventCount, eventType)
+				}
+
+				// Collect text and tool outputs for final response
 				if eventType == "text" {
 					if text, ok := eventData.(string); ok {
 						textCollector.WriteString(text)
+						// Send progress with accumulated text for real-time display
+						sendProgress(w, flusher, req.ID, eventCount, textCollector.String())
+					}
+				} else if eventType == "tool_use" {
+					if m, ok := eventData.(map[string]any); ok {
+						toolName, _ := m["tool"].(string)
+						status, _ := m["status"].(string)
+						if status == "completed" {
+							if toolName != "" {
+								if output, ok := m["output"].(string); ok && output != "" {
+									toolOutputs = append(toolOutputs, fmt.Sprintf("[Tool: %s]\n%s", toolName, output))
+								}
+							}
+							// Progress: tool completed (user sees activity)
+							sendProgress(w, flusher, req.ID, eventCount, fmt.Sprintf("Tool %s completed", toolName))
+						}
+					}
+				} else if eventType == "step_start" || eventType == "step_finish" {
+					// Progress: step update (user sees activity)
+					if m, ok := eventData.(map[string]any); ok {
+						reason, _ := m["reason"].(string)
+						msg := eventType
+						if reason != "" {
+							msg = fmt.Sprintf("%s: %s", eventType, reason)
+						}
+						sendProgress(w, flusher, req.ID, eventCount, msg)
 					}
 				}
 
-				// Extract text content for cleaner streaming
+				// Stream event to client
 				notification := map[string]any{
 					"jsonrpc": "2.0",
 					"method":  "notifications/message",
@@ -987,7 +1123,11 @@ func handleToolsCallSSE(w http.ResponseWriter, ctx context.Context, cfg serverCo
 			}
 		}
 
-		// Generic: send raw line
+		// Generic: send raw line (for models, session list, exec, or non-JSON toolRun output)
+		eventCount++
+		log.Printf("[stream] raw#%d len=%d preview=%s", eventCount, len(line), truncateForLog(line, 150))
+		textCollector.WriteString(line)
+		textCollector.WriteString("\n")
 		notification := map[string]any{
 			"jsonrpc": "2.0",
 			"method":  "notifications/progress",
@@ -1009,8 +1149,16 @@ func handleToolsCallSSE(w http.ResponseWriter, ctx context.Context, cfg serverCo
 		}
 	}
 
-	// Send final result with collected text
+	// Build final result: text + tool outputs (for completeness)
 	resultText := textCollector.String()
+	if len(toolOutputs) > 0 {
+		if resultText != "" {
+			resultText += "\n\n--- Tool Outputs ---\n"
+		} else {
+			resultText = "--- Tool Outputs ---\n"
+		}
+		resultText += strings.Join(toolOutputs, "\n\n")
+	}
 	stderrStr := stderrBuf.String()
 	if stderrStr != "" {
 		if resultText != "" {
@@ -1021,6 +1169,20 @@ func handleToolsCallSSE(w http.ResponseWriter, ctx context.Context, cfg serverCo
 	if exitCode != 0 {
 		resultText += fmt.Sprintf("\n[exit code: %d]", exitCode)
 	}
+
+	// Log completion summary
+	if len(eventTypeCounts) > 0 {
+		counts := make([]string, 0, len(eventTypeCounts))
+		for k, v := range eventTypeCounts {
+			counts = append(counts, fmt.Sprintf("%s=%d", k, v))
+		}
+		log.Printf("[tools/call] done tool=%s events=%d counts=%v resultLen=%d exitCode=%d stderrLen=%d",
+			params.Name, eventCount, counts, len(resultText), exitCode, len(stderrStr))
+	} else {
+		log.Printf("[tools/call] done tool=%s lines=%d resultLen=%d exitCode=%d stderrLen=%d",
+			params.Name, eventCount, len(resultText), exitCode, len(stderrStr))
+	}
+	log.Printf("[tools/call] result preview: %s", truncateForLog(resultText, 200))
 
 	result := toolCallResult{
 		Content: []toolContent{{Type: "text", Text: resultText}},
@@ -1051,10 +1213,12 @@ func extractEventData(event map[string]any) any {
 			return text
 		}
 	case "tool_use":
+		toolName, _ := part["tool"].(string)
 		if state, ok := part["state"].(map[string]any); ok {
+			status, _ := state["status"].(string)
 			result := map[string]any{
-				"tool":   part["tool"],
-				"status": state["status"],
+				"tool":   toolName,
+				"status": status,
 			}
 			if input, ok := state["input"].(map[string]any); ok {
 				result["input"] = input
@@ -1062,22 +1226,27 @@ func extractEventData(event map[string]any) any {
 			if output, ok := state["output"]; ok {
 				result["output"] = output
 			}
+			if errMsg, ok := state["error"].(string); ok && errMsg != "" {
+				result["error"] = errMsg
+			}
 			return result
 		}
-	case "step_start", "step_finish":
-		return map[string]any{
-			"type":   eventType,
-			"reason": part["reason"],
-		}
+		return map[string]any{"tool": toolName, "status": "unknown"}
+	case "step_start":
+		reason, _ := part["reason"].(string)
+		return map[string]any{"type": "step_start", "reason": reason}
+	case "step_finish":
+		reason, _ := part["reason"].(string)
+		return map[string]any{"type": "step_finish", "reason": reason}
 	}
 
 	return event
 }
 
-// parseJSONEventStream parses opencode-cli JSON event stream and extracts readable text
+// parseJSONEventStream parses opencode-cli JSON event stream and extracts readable text.
+// Preserves step_start, step_finish, tool_use (all states: in_progress, completed, error).
 func parseJSONEventStream(jsonLines string) string {
-	var textParts []string
-	var toolOutputs []string
+	var parts []string
 
 	lines := strings.Split(jsonLines, "\n")
 	for _, line := range lines {
@@ -1100,28 +1269,37 @@ func parseJSONEventStream(jsonLines string) string {
 		switch eventType {
 		case "text":
 			if text, ok := part["text"].(string); ok && text != "" {
-				textParts = append(textParts, text)
+				parts = append(parts, text)
+			}
+		case "step_start":
+			if reason, ok := part["reason"].(string); ok && reason != "" {
+				parts = append(parts, fmt.Sprintf("\n[Step started: %s]\n", reason))
+			}
+		case "step_finish":
+			if reason, ok := part["reason"].(string); ok && reason != "" {
+				parts = append(parts, fmt.Sprintf("[Step finished: %s]\n", reason))
 			}
 		case "tool_use":
+			toolName, _ := part["tool"].(string)
 			if state, ok := part["state"].(map[string]any); ok {
 				status, _ := state["status"].(string)
-				if status == "completed" {
-					toolName, _ := part["tool"].(string)
+				switch status {
+				case "in_progress":
+					parts = append(parts, fmt.Sprintf("[Tool: %s] running...\n", toolName))
+				case "completed":
 					if output, ok := state["output"].(string); ok && output != "" {
-						toolOutputs = append(toolOutputs, fmt.Sprintf("[Tool: %s]\n%s", toolName, output))
+						parts = append(parts, fmt.Sprintf("[Tool: %s]\n%s\n", toolName, output))
 					}
+				case "error":
+					errMsg, _ := state["error"].(string)
+					if errMsg == "" {
+						errMsg = "unknown error"
+					}
+					parts = append(parts, fmt.Sprintf("[Tool: %s] error: %s\n", toolName, errMsg))
 				}
 			}
 		}
 	}
 
-	// Combine text parts (they form the AI response)
-	result := strings.Join(textParts, "")
-
-	// Append tool outputs if any
-	if len(toolOutputs) > 0 {
-		result += "\n\n--- Tool Outputs ---\n" + strings.Join(toolOutputs, "\n\n")
-	}
-
-	return result
+	return strings.Join(parts, "")
 }

@@ -50,6 +50,7 @@ go test ./cmd/mcpserver/...
 | `MCP_ADDR` | `:9876` | Server listen address |
 | `MCP_TARGET` | `opencode-cli` | Path to opencode-cli executable |
 | `MCP_TIMEOUT_SEC` | `120` | Command timeout in seconds |
+| `MCP_DEFAULT_MODEL` | *(auto)* | Default model for `opencode_run`. If unset, uses first available from `opencode models`, or omits `--model` to let opencode use its default (avoids `ProviderModelNotFoundError`) |
 
 ### Docker-specific Variables
 

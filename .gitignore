@@ -51,3 +51,9 @@ build/
 # Debug files
 debug
 __debug_bin*
+
+# OpenCode runtime data (session, history, snapshots)
+.opencode/*.db
+.opencode/*.db-shm
+.opencode/*.db-wal
+.opencode/init

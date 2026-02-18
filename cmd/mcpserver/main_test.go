@@ -31,6 +31,37 @@ func createTestServer(t *testing.T) (*http.Server, *http.ServeMux, serverConfig)
 	return srv, mux, cfg
 }
 
+// parseSSEResponse extracts MCP response from body. tools/call returns SSE; errors return JSON.
+func parseSSEResponse(body []byte) (mcpResponse, error) {
+	bodyStr := strings.TrimSpace(string(body))
+	// Try plain JSON first (for errors like unknown tool)
+	if strings.HasPrefix(bodyStr, "{") {
+		var resp mcpResponse
+		if err := json.Unmarshal(body, &resp); err == nil {
+			return resp, nil
+		}
+	}
+	// Parse SSE stream, extract final result
+	var lastResp mcpResponse
+	for _, line := range strings.Split(bodyStr, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "data: ") {
+			jsonStr := strings.TrimPrefix(line, "data: ")
+			var msg map[string]any
+			if err := json.Unmarshal([]byte(jsonStr), &msg); err != nil {
+				continue
+			}
+			if _, hasResult := msg["result"]; hasResult && msg["method"] == nil {
+				_ = json.Unmarshal([]byte(jsonStr), &lastResp)
+			}
+			if msg["error"] != nil {
+				_ = json.Unmarshal([]byte(jsonStr), &lastResp)
+			}
+		}
+	}
+	return lastResp, nil
+}
+
 func doMCPRequest(t *testing.T, handler http.HandlerFunc, method string, id any, params any) mcpResponse {
 	t.Helper()
 	reqBody := map[string]any{
@@ -809,8 +840,8 @@ esac
 
 			handler.ServeHTTP(rec, req)
 
-			var resp mcpResponse
-			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			resp, err := parseSSEResponse(rec.Body.Bytes())
+			if err != nil {
 				t.Fatalf("failed to parse response: %v", err)
 			}
 
@@ -894,8 +925,8 @@ echo "Args: $@"
 
 	handler.ServeHTTP(rec, req)
 
-	var resp mcpResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	resp, err := parseSSEResponse(rec.Body.Bytes())
+	if err != nil {
 		t.Fatalf("failed to parse response: %v", err)
 	}
 
@@ -1087,9 +1118,6 @@ func createMCPHandler(sessions *sessionStore, cfg serverConfig) http.HandlerFunc
 			return
 		}
 
-		// Check Accept header for SSE support
-		acceptSSE := strings.Contains(r.Header.Get("Accept"), "text/event-stream")
-
 		var req mcpRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeMCPError(w, nil, -32700, "invalid JSON")
@@ -1131,11 +1159,7 @@ func createMCPHandler(sessions *sessionStore, cfg serverConfig) http.HandlerFunc
 		case "tools/list":
 			handleToolsList(w, req)
 		case "tools/call":
-			if acceptSSE {
-				handleToolsCallSSE(w, r.Context(), cfg, req)
-			} else {
-				handleToolsCall(w, r.Context(), cfg, req)
-			}
+			handleToolsCallSSE(w, r.Context(), cfg, req)
 		default:
 			writeMCPError(w, req.ID, -32601, fmt.Sprintf("method not found: %s", req.Method))
 		}
